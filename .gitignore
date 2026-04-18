@@ -1,0 +1,35 @@
+# Scan output
+*.csv
+
+# Checkpoint files
+localscan_checkpoint.json
+dupescan_checkpoint.json
+
+# Media files
+*.mp3
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flac
+*.wav
+*.aac
+*.ogg
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.webp
+*.svg
+*.ico
+*.heic
+*.heif
+*.raw
+*.cr2
+*.nef
+*.arw
