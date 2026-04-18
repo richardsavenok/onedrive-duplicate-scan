@@ -6,6 +6,10 @@
 
 #Requires -Version 5.1
 
+param(
+    [switch]$GroupDuplicates
+)
+
 # --- Helper for safe nested property access (handles mixed PSObject/Hashtable) ---
 function Get-NestedValue {
     param($obj, [string[]]$path)
@@ -235,7 +239,8 @@ if ($missingHashItems.Count -gt 0) {
 
 # --- Export to CSV ---
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$csvPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "OneDrive_Hashes_$timestamp.csv"
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
+$csvPath = Join-Path $scriptDir "OneDrive_Hashes_$timestamp.csv"
 
 $global:Results | Sort-Object FullPath | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
@@ -250,4 +255,65 @@ if ($missingHashItems.Count -gt 0) {
     Write-Host "  Hashes recovered:    $recovered (from $($missingHashItems.Count) missing)" -ForegroundColor White
 }
 Write-Host "  Results saved to:    $csvPath" -ForegroundColor Cyan
-Write-Host "  Find duplicates by grouping on the QuickXorHash column." -ForegroundColor Cyan
+
+if ($GroupDuplicates) {
+    $duplicateGroups = $global:Results |
+        Group-Object -Property QuickXorHash |
+        Where-Object { $_.Count -gt 1 } |
+        Sort-Object { $_.Count } -Descending
+
+    if ($duplicateGroups.Count -eq 0) {
+        Write-Host "`n  No duplicates found." -ForegroundColor Green
+    }
+    else {
+        $totalDuplicateFiles = ($duplicateGroups | Measure-Object -Property Count -Sum).Sum
+        $wastedBytes = ($duplicateGroups | ForEach-Object {
+            ($_.Group[0].SizeBytes) * ($_.Count - 1)
+        } | Measure-Object -Sum).Sum
+        $wastedMB = [math]::Round($wastedBytes / 1MB, 2)
+
+        Write-Host "`n=== Duplicate Report ===" -ForegroundColor Yellow
+        Write-Host "  Duplicate groups:    $($duplicateGroups.Count)" -ForegroundColor White
+        Write-Host "  Total duplicate files: $totalDuplicateFiles" -ForegroundColor White
+        Write-Host "  Wasted space:        $wastedMB MB" -ForegroundColor White
+
+        $dupRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $groupNum = 0
+        foreach ($group in $duplicateGroups) {
+            $groupNum++
+            foreach ($file in ($group.Group | Sort-Object FullPath)) {
+                $null = $dupRows.Add([PSCustomObject]@{
+                    DuplicateGroup = $groupNum
+                    FullPath       = $file.FullPath
+                    FileName       = $file.FileName
+                    QuickXorHash   = $file.QuickXorHash
+                    SizeBytes      = $file.SizeBytes
+                    LastModified   = $file.LastModified
+                    Created        = $file.Created
+                })
+            }
+        }
+
+        $dupCsvPath = Join-Path $scriptDir "OneDrive_Duplicates_$timestamp.csv"
+        $dupRows | Export-Csv -Path $dupCsvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "  Duplicates saved to: $dupCsvPath" -ForegroundColor Cyan
+
+        Write-Host "`n--- Top 10 Duplicate Groups ---" -ForegroundColor Yellow
+        $shown = 0
+        foreach ($group in $duplicateGroups) {
+            if ($shown -ge 10) { break }
+            $shown++
+            $sizeMB = [math]::Round($group.Group[0].SizeBytes / 1MB, 2)
+            Write-Host "  Group $shown ($($group.Count) copies, $sizeMB MB each):" -ForegroundColor White
+            foreach ($file in ($group.Group | Sort-Object FullPath)) {
+                Write-Host "    $($file.FullPath)" -ForegroundColor Gray
+            }
+        }
+        if ($duplicateGroups.Count -gt 10) {
+            Write-Host "  ... and $($duplicateGroups.Count - 10) more groups (see CSV for full list)" -ForegroundColor DarkGray
+        }
+    }
+}
+else {
+    Write-Host "  Tip: Run with -GroupDuplicates to identify and report duplicate files." -ForegroundColor Cyan
+}
