@@ -1,18 +1,34 @@
-# OneDrive Duplicate Scanner
+# Duplicate File Scanner
 
-A PowerShell script that scans your entire OneDrive cloud storage via the Microsoft Graph API to identify duplicate files using QuickXorHash fingerprints. No files are downloaded -- everything runs against the cloud API.
+PowerShell scripts for finding duplicate files -- in OneDrive cloud storage or on a local drive.
 
-## What It Does
+## Scripts
+
+### `dupescan.ps1` -- OneDrive Cloud Scanner
+
+Scans your entire OneDrive via the Microsoft Graph API using QuickXorHash fingerprints. No files are downloaded.
 
 1. **Authenticates** with Microsoft Graph using interactive browser login.
-2. **Scans** every folder in your OneDrive using breadth-first traversal, collecting file metadata and QuickXorHash values.
+2. **Scans** every folder using breadth-first traversal, collecting file metadata and QuickXorHash values.
 3. **Recovers missing hashes** via batch API requests for files that didn't return a hash on the first pass.
-4. **Exports** all file records (path, name, hash, size, dates) to a timestamped CSV in the script directory.
-5. **Optionally groups duplicates** -- when run with `-GroupDuplicates`, produces a second CSV listing duplicate groups and prints a summary with wasted space calculations.
+4. **Exports** all file records to a timestamped CSV in the script directory.
+5. **Optionally groups duplicates** with `-GroupDuplicates`.
+
+### `localscan.ps1` -- Local Drive Scanner
+
+Scans a local directory tree, hashing files to find duplicates. Uses a size pre-filter to skip hashing files with unique sizes, dramatically speeding up large scans.
+
+1. **Enumerates** all files recursively in the target directory.
+2. **Groups by file size** -- files with a unique size can't be duplicates, so they're skipped.
+3. **Hashes** only files that share a size with at least one other file.
+4. **Exports** all file records to a timestamped CSV in the script directory.
+5. **Optionally groups duplicates** with `-GroupDuplicates`.
 
 ## Prerequisites
 
 - PowerShell 5.1 or later
+
+For the OneDrive scanner only:
 - The `Microsoft.Graph.Authentication` module:
 
 ```powershell
@@ -23,32 +39,46 @@ Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
 
 ## Usage
 
-### Basic scan (export all file hashes)
+### OneDrive scan
 
 ```powershell
+# Basic scan
 .\dupescan.ps1
-```
 
-Produces `OneDrive_Hashes_<timestamp>.csv` in the script directory.
-
-### Scan with duplicate detection
-
-```powershell
+# With duplicate grouping
 .\dupescan.ps1 -GroupDuplicates
 ```
 
-Produces both:
-- `OneDrive_Hashes_<timestamp>.csv` -- all files with their hashes
-- `OneDrive_Duplicates_<timestamp>.csv` -- only duplicate files, grouped and numbered
+### Local drive scan
 
-The console will also display:
-- Total number of duplicate groups
-- Total wasted space in MB
-- The top 10 largest duplicate groups with file paths
+```powershell
+# Basic scan
+.\localscan.ps1 -Path "D:\Photos"
+
+# With duplicate grouping
+.\localscan.ps1 -Path "C:\Users\me\Documents" -GroupDuplicates
+
+# Use a faster hash algorithm
+.\localscan.ps1 -Path "D:\" -Algorithm MD5 -GroupDuplicates
+
+# Exclude directories by wildcard
+.\localscan.ps1 -Path "C:\" -Exclude "*\node_modules\*", "*\.git\*" -GroupDuplicates
+```
+
+#### Parameters
+
+| Parameter | Required | Description |
+|---|---|---|
+| `-Path` | Yes | Directory to scan |
+| `-GroupDuplicates` | No | Produce a duplicate report and CSV |
+| `-Algorithm` | No | Hash algorithm: `SHA256` (default), `SHA1`, or `MD5` |
+| `-Exclude` | No | Wildcard patterns to exclude (matched against full path) |
 
 ## Output
 
-### Hashes CSV columns
+Both scripts produce CSVs in the script directory. With `-GroupDuplicates`, a second CSV is generated containing only duplicate files grouped by number.
+
+### OneDrive hashes CSV
 
 | Column | Description |
 |---|---|
@@ -60,14 +90,33 @@ The console will also display:
 | Created | Creation timestamp |
 | ItemId | Graph API item ID |
 
-### Duplicates CSV columns (with `-GroupDuplicates`)
+### Local hashes CSV
+
+| Column | Description |
+|---|---|
+| FullPath | Full local file path |
+| FileName | File name |
+| FileHash | Hash value (or `ERROR` / empty if skipped) |
+| SizeBytes | File size in bytes |
+| LastModified | Last modified timestamp |
+| Created | Creation timestamp |
+
+### Duplicates CSV (both scripts)
 
 | Column | Description |
 |---|---|
 | DuplicateGroup | Group number (1 = most copies) |
-| FullPath | Full OneDrive path |
+| FullPath | File path |
 | FileName | File name |
-| QuickXorHash | Shared hash identifying the duplicate set |
+| FileHash / QuickXorHash | Hash identifying the duplicate set |
 | SizeBytes | File size in bytes |
 | LastModified | Last modified timestamp |
 | Created | Creation timestamp |
+
+## Duplicate report
+
+When `-GroupDuplicates` is used, the console displays:
+- Total number of duplicate groups
+- Total duplicate files
+- Wasted space in MB
+- The top 10 duplicate groups with file paths
