@@ -2,6 +2,7 @@
 # ROBUST OneDrive Full Scan - QuickXorHash + Path
 # Uses raw Graph API with batch retry for missing hashes
 # Works 100% in the cloud - no local files downloaded
+# Supports checkpoint/resume for interrupted scans
 # ================================================
 
 #Requires -Version 5.1
@@ -23,6 +24,55 @@ function Get-NestedValue {
         }
     }
     return $current
+}
+
+# --- Helper: append rows to checkpoint CSV ---
+function Save-CheckpointBatch {
+    param(
+        [System.Collections.Generic.List[PSCustomObject]]$Items,
+        [string]$FilePath
+    )
+    if ($Items.Count -eq 0) { return }
+    if (-not (Test-Path $FilePath)) {
+        $Items | Export-Csv -Path $FilePath -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        $Items | ConvertTo-Csv -NoTypeInformation | Select-Object -Skip 1 | Add-Content -Path $FilePath -Encoding UTF8
+    }
+}
+
+# --- Helper: save checkpoint metadata + queue ---
+function Save-CheckpointMeta {
+    param(
+        [string]$MetaPath,
+        [string]$DriveId,
+        [string]$StartedAt,
+        [int]$FoldersScanned,
+        [int]$FilesFound,
+        [int]$TotalItemsSeen,
+        [bool]$Pass1Complete,
+        [System.Collections.Generic.Queue[hashtable]]$Queue
+    )
+    $queueArray = @()
+    if ($Queue -and $Queue.Count -gt 0) {
+        foreach ($qItem in $Queue.ToArray()) {
+            $queueArray += @{
+                DriveId     = $qItem.DriveId
+                ItemId      = $qItem.ItemId
+                CurrentPath = $qItem.CurrentPath
+            }
+        }
+    }
+    @{
+        DriveId          = $DriveId
+        StartedAt        = $StartedAt
+        FoldersScanned   = $FoldersScanned
+        FilesFound       = $FilesFound
+        TotalItemsSeen   = $TotalItemsSeen
+        Pass1Complete    = $Pass1Complete
+        QueueCount       = $queueArray.Count
+        Queue            = $queueArray
+    } | ConvertTo-Json -Depth 5 | Set-Content $MetaPath -Encoding UTF8
 }
 
 # --- Prerequisite check ---
@@ -58,116 +108,271 @@ $rootDriveId = $drive.id
 
 Write-Host "      Drive ID: $rootDriveId (retrieved in $([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Gray
 
-# --- Initialize scan ---
+# --- Checkpoint paths ---
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
+$checkpointMeta = Join-Path $scriptDir "dupescan_checkpoint.json"
+$checkpointResults = Join-Path $scriptDir "dupescan_checkpoint_results.csv"
+$checkpointMissing = Join-Path $scriptDir "dupescan_checkpoint_missing.csv"
+
+# --- Check for existing checkpoint ---
+$resuming = $false
+$pass1Complete = $false
+$startedAt = (Get-Date -Format "o")
+
 $global:Results = [System.Collections.Generic.List[PSCustomObject]]::new()
 $missingHashItems = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 $queue = [System.Collections.Generic.Queue[hashtable]]::new()
-$queue.Enqueue(@{
-    DriveId     = $rootDriveId
-    ItemId      = "root"
-    CurrentPath = ""
-})
-
 $foldersScanned = 0
 $filesFound = 0
 $totalItemsSeen = 0
-$scanStart = [System.Diagnostics.Stopwatch]::StartNew()
 
-Write-Host "`nStarting full OneDrive scan..." -ForegroundColor Green
+if (Test-Path $checkpointMeta) {
+    $meta = Get-Content $checkpointMeta -Raw | ConvertFrom-Json
 
-# --- BFS scan (Pass 1) ---
-while ($queue.Count -gt 0) {
-    $current = $queue.Dequeue()
-    $driveId = $current.DriveId
-    $itemId = $current.ItemId
-    $path = $current.CurrentPath
+    Write-Host "`nFound an existing scan checkpoint:" -ForegroundColor Yellow
+    Write-Host "  Drive ID:         $($meta.DriveId)" -ForegroundColor White
+    Write-Host "  Started at:       $($meta.StartedAt)" -ForegroundColor White
+    Write-Host "  Folders scanned:  $($meta.FoldersScanned)" -ForegroundColor White
+    Write-Host "  Files found:      $($meta.FilesFound)" -ForegroundColor White
+    Write-Host "  Queue remaining:  $($meta.QueueCount)" -ForegroundColor White
+    Write-Host "  Pass 1 complete:  $($meta.Pass1Complete)" -ForegroundColor White
 
-    $foldersScanned++
-    $elapsed = $scanStart.Elapsed.ToString("hh\:mm\:ss")
+    $choice = Read-Host "`nContinue from checkpoint? (Y = continue, N = start fresh)"
 
-    Write-Progress -Activity "Scanning OneDrive [$elapsed elapsed]" `
-        -Status "Folder: $path" `
-        -CurrentOperation "Files: $filesFound | Folders scanned: $foldersScanned | Queue: $($queue.Count)" `
-        -Id 1
+    if ($choice -match '^[Yy]') {
+        if ($meta.DriveId -ne $rootDriveId) {
+            Write-Host "  Drive ID differs from checkpoint. Starting fresh." -ForegroundColor Red
+            Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+            Remove-Item $checkpointResults -ErrorAction SilentlyContinue
+            Remove-Item $checkpointMissing -ErrorAction SilentlyContinue
+        }
+        else {
+            $resuming = $true
+            $startedAt = $meta.StartedAt
+            $foldersScanned = [int]$meta.FoldersScanned
+            $filesFound = [int]$meta.FilesFound
+            $totalItemsSeen = [int]$meta.TotalItemsSeen
+            $pass1Complete = [bool]$meta.Pass1Complete
 
-    if ($foldersScanned % 50 -eq 0) {
-        Write-Host "  Progress: $foldersScanned folders scanned, $filesFound files with hash, $($missingHashItems.Count) missing hash, $($queue.Count) queued [$elapsed]" -ForegroundColor DarkGray
-    }
-
-    $nextLink = "https://graph.microsoft.com/v1.0/drives/$driveId/items/$itemId/children?`$select=id,name,file,folder,size,lastModifiedDateTime,createdDateTime&`$top=999"
-
-    do {
-        try {
-            $response = Invoke-MgGraphRequest -Method GET -Uri $nextLink -OutputType PSObject
-
-            foreach ($item in $response.value) {
-                $totalItemsSeen++
-                $fullPath = if ($path) { "$path/$($item.name)" } else { $item.name }
-
-                if ($item.file) {
-                    $hash = Get-NestedValue $item @('file', 'hashes', 'quickXorHash')
-
-                    if ($hash) {
-                        $filesFound++
-                        $null = $global:Results.Add([PSCustomObject]@{
-                            FullPath       = "/$fullPath"
-                            FileName       = $item.name
-                            QuickXorHash   = $hash
-                            SizeBytes      = $item.size
-                            LastModified   = $item.lastModifiedDateTime
-                            Created        = $item.createdDateTime
-                            ItemId         = $item.id
-                        })
-                    }
-                    elseif ($item.size -gt 0) {
-                        $null = $missingHashItems.Add([PSCustomObject]@{
-                            FullPath       = "/$fullPath"
-                            FileName       = $item.name
-                            SizeBytes      = $item.size
-                            LastModified   = $item.lastModifiedDateTime
-                            Created        = $item.createdDateTime
-                            ItemId         = $item.id
-                            DriveId        = $driveId
-                        })
-                    }
-                }
-
-                if ($item.folder) {
-                    $queue.Enqueue(@{
-                        DriveId     = $driveId
-                        ItemId      = $item.id
-                        CurrentPath = $fullPath
+            if (Test-Path $checkpointResults) {
+                foreach ($row in (Import-Csv $checkpointResults)) {
+                    $null = $global:Results.Add([PSCustomObject]@{
+                        FullPath     = $row.FullPath
+                        FileName     = $row.FileName
+                        QuickXorHash = $row.QuickXorHash
+                        SizeBytes    = [long]$row.SizeBytes
+                        LastModified = $row.LastModified
+                        Created      = $row.Created
+                        ItemId       = $row.ItemId
                     })
                 }
             }
 
-            $nextLink = $response.'@odata.nextLink'
+            if (Test-Path $checkpointMissing) {
+                foreach ($row in (Import-Csv $checkpointMissing)) {
+                    $null = $missingHashItems.Add([PSCustomObject]@{
+                        FullPath     = $row.FullPath
+                        FileName     = $row.FileName
+                        SizeBytes    = [long]$row.SizeBytes
+                        LastModified = $row.LastModified
+                        Created      = $row.Created
+                        ItemId       = $row.ItemId
+                        DriveId      = $row.DriveId
+                    })
+                }
+            }
+
+            if (-not $pass1Complete -and $meta.Queue) {
+                foreach ($qItem in $meta.Queue) {
+                    $queue.Enqueue(@{
+                        DriveId     = $qItem.DriveId
+                        ItemId      = $qItem.ItemId
+                        CurrentPath = $qItem.CurrentPath
+                    })
+                }
+            }
+
+            Write-Host "  Restored $($global:Results.Count) results, $($missingHashItems.Count) missing-hash items, $($queue.Count) queued folders." -ForegroundColor Green
         }
-        catch {
-            Write-Warning "Error scanning folder '$path': $($_.Exception.Message)"
-            $nextLink = $null
-        }
-    } while ($nextLink)
+    }
+    else {
+        Write-Host "Starting fresh scan." -ForegroundColor Cyan
+        Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+        Remove-Item $checkpointResults -ErrorAction SilentlyContinue
+        Remove-Item $checkpointMissing -ErrorAction SilentlyContinue
+    }
 }
 
-Write-Progress -Activity "Scanning OneDrive" -Completed -Id 1
+# --- Initialize fresh scan if not resuming ---
+if (-not $resuming) {
+    $queue.Enqueue(@{
+        DriveId     = $rootDriveId
+        ItemId      = "root"
+        CurrentPath = ""
+    })
 
-$elapsed = $scanStart.Elapsed.ToString("hh\:mm\:ss")
-Write-Host "`nBFS scan complete [$elapsed]. Found $filesFound files with hash, $($missingHashItems.Count) files with missing hash." -ForegroundColor Green
+    Save-CheckpointMeta -MetaPath $checkpointMeta -DriveId $rootDriveId -StartedAt $startedAt `
+        -FoldersScanned 0 -FilesFound 0 -TotalItemsSeen 0 -Pass1Complete $false -Queue $queue
+}
+
+$scanStart = [System.Diagnostics.Stopwatch]::StartNew()
+
+# --- BFS scan (Pass 1) ---
+if (-not $pass1Complete) {
+    if ($resuming) {
+        Write-Host "`nResuming BFS scan ($($queue.Count) folders remaining)..." -ForegroundColor Green
+    }
+    else {
+        Write-Host "`nStarting full OneDrive scan..." -ForegroundColor Green
+    }
+
+    $resultsBuffer = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $missingBuffer = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $foldersSinceCheckpoint = 0
+    $checkpointInterval = 50
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        $driveId = $current.DriveId
+        $itemId = $current.ItemId
+        $path = $current.CurrentPath
+
+        $foldersScanned++
+        $foldersSinceCheckpoint++
+        $elapsed = $scanStart.Elapsed.ToString("hh\:mm\:ss")
+
+        Write-Progress -Activity "Scanning OneDrive [$elapsed elapsed]" `
+            -Status "Folder: $path" `
+            -CurrentOperation "Files: $filesFound | Folders scanned: $foldersScanned | Queue: $($queue.Count)" `
+            -Id 1
+
+        if ($foldersScanned % 50 -eq 0) {
+            Write-Host "  Progress: $foldersScanned folders scanned, $filesFound files with hash, $($missingHashItems.Count + $missingBuffer.Count) missing hash, $($queue.Count) queued [$elapsed]" -ForegroundColor DarkGray
+        }
+
+        $nextLink = "https://graph.microsoft.com/v1.0/drives/$driveId/items/$itemId/children?`$select=id,name,file,folder,size,lastModifiedDateTime,createdDateTime&`$top=999"
+
+        do {
+            try {
+                $response = Invoke-MgGraphRequest -Method GET -Uri $nextLink -OutputType PSObject
+
+                foreach ($item in $response.value) {
+                    $totalItemsSeen++
+                    $fullPath = if ($path) { "$path/$($item.name)" } else { $item.name }
+
+                    if ($item.file) {
+                        $hash = Get-NestedValue $item @('file', 'hashes', 'quickXorHash')
+
+                        if ($hash) {
+                            $filesFound++
+                            $resultObj = [PSCustomObject]@{
+                                FullPath     = "/$fullPath"
+                                FileName     = $item.name
+                                QuickXorHash = $hash
+                                SizeBytes    = $item.size
+                                LastModified = $item.lastModifiedDateTime
+                                Created      = $item.createdDateTime
+                                ItemId       = $item.id
+                            }
+                            $null = $global:Results.Add($resultObj)
+                            $null = $resultsBuffer.Add($resultObj)
+                        }
+                        elseif ($item.size -gt 0) {
+                            $missingObj = [PSCustomObject]@{
+                                FullPath     = "/$fullPath"
+                                FileName     = $item.name
+                                SizeBytes    = $item.size
+                                LastModified = $item.lastModifiedDateTime
+                                Created      = $item.createdDateTime
+                                ItemId       = $item.id
+                                DriveId      = $driveId
+                            }
+                            $null = $missingHashItems.Add($missingObj)
+                            $null = $missingBuffer.Add($missingObj)
+                        }
+                    }
+
+                    if ($item.folder) {
+                        $queue.Enqueue(@{
+                            DriveId     = $driveId
+                            ItemId      = $item.id
+                            CurrentPath = $fullPath
+                        })
+                    }
+                }
+
+                $nextLink = $response.'@odata.nextLink'
+            }
+            catch {
+                Write-Warning "Error scanning folder '$path': $($_.Exception.Message)"
+                $nextLink = $null
+            }
+        } while ($nextLink)
+
+        if ($foldersSinceCheckpoint -ge $checkpointInterval) {
+            Save-CheckpointBatch $resultsBuffer $checkpointResults
+            Save-CheckpointBatch $missingBuffer $checkpointMissing
+            $resultsBuffer.Clear()
+            $missingBuffer.Clear()
+
+            Save-CheckpointMeta -MetaPath $checkpointMeta -DriveId $rootDriveId -StartedAt $startedAt `
+                -FoldersScanned $foldersScanned -FilesFound $filesFound -TotalItemsSeen $totalItemsSeen `
+                -Pass1Complete $false -Queue $queue
+
+            $foldersSinceCheckpoint = 0
+        }
+    }
+
+    if ($resultsBuffer.Count -gt 0 -or $missingBuffer.Count -gt 0) {
+        Save-CheckpointBatch $resultsBuffer $checkpointResults
+        Save-CheckpointBatch $missingBuffer $checkpointMissing
+        $resultsBuffer.Clear()
+        $missingBuffer.Clear()
+    }
+
+    Save-CheckpointMeta -MetaPath $checkpointMeta -DriveId $rootDriveId -StartedAt $startedAt `
+        -FoldersScanned $foldersScanned -FilesFound $filesFound -TotalItemsSeen $totalItemsSeen `
+        -Pass1Complete $true -Queue $queue
+
+    Write-Progress -Activity "Scanning OneDrive" -Completed -Id 1
+
+    $elapsed = $scanStart.Elapsed.ToString("hh\:mm\:ss")
+    Write-Host "`nBFS scan complete [$elapsed]. Found $filesFound files with hash, $($missingHashItems.Count) files with missing hash." -ForegroundColor Green
+}
+else {
+    Write-Host "`nBFS scan already complete (from checkpoint). $($global:Results.Count) results, $($missingHashItems.Count) missing-hash items." -ForegroundColor Green
+}
 
 # --- Batch retry for missing hashes (Pass 2) ---
+$existingIds = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($r in $global:Results) { $null = $existingIds.Add($r.ItemId) }
+
+$pass2Items = [System.Collections.Generic.List[PSCustomObject]]::new()
+foreach ($item in $missingHashItems) {
+    if (-not $existingIds.Contains($item.ItemId)) {
+        $null = $pass2Items.Add($item)
+    }
+}
+
 $recovered = 0
 $stillMissing = 0
+$alreadyRecovered = $missingHashItems.Count - $pass2Items.Count
 
-if ($missingHashItems.Count -gt 0) {
-    Write-Host "`nRetrieving missing hashes via batch requests ($($missingHashItems.Count) files)..." -ForegroundColor Yellow
+if ($alreadyRecovered -gt 0) {
+    Write-Host "  $alreadyRecovered missing-hash items already recovered in previous run." -ForegroundColor Gray
+}
+
+if ($pass2Items.Count -gt 0) {
+    Write-Host "`nRetrieving missing hashes via batch requests ($($pass2Items.Count) files)..." -ForegroundColor Yellow
 
     $batchSize = 20
+    $recoveredBuffer = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $batchesSinceCheckpoint = 0
 
-    for ($i = 0; $i -lt $missingHashItems.Count; $i += $batchSize) {
-        $endIndex = [math]::Min($i + $batchSize - 1, $missingHashItems.Count - 1)
-        $batch = $missingHashItems[$i..$endIndex]
+    for ($i = 0; $i -lt $pass2Items.Count; $i += $batchSize) {
+        $endIndex = [math]::Min($i + $batchSize - 1, $pass2Items.Count - 1)
+        $batch = $pass2Items[$i..$endIndex]
 
         $requests = @()
         $requestIndex = 0
@@ -207,15 +412,17 @@ if ($missingHashItems.Count -gt 0) {
 
                 if ($status -eq 200 -and $hash) {
                     $recovered++
-                    $null = $global:Results.Add([PSCustomObject]@{
-                        FullPath       = $file.FullPath
-                        FileName       = $file.FileName
-                        QuickXorHash   = $hash
-                        SizeBytes      = $file.SizeBytes
-                        LastModified   = $file.LastModified
-                        Created        = $file.Created
-                        ItemId         = $file.ItemId
-                    })
+                    $resultObj = [PSCustomObject]@{
+                        FullPath     = $file.FullPath
+                        FileName     = $file.FileName
+                        QuickXorHash = $hash
+                        SizeBytes    = $file.SizeBytes
+                        LastModified = $file.LastModified
+                        Created      = $file.Created
+                        ItemId       = $file.ItemId
+                    }
+                    $null = $global:Results.Add($resultObj)
+                    $null = $recoveredBuffer.Add($resultObj)
                 }
                 else {
                     $stillMissing++
@@ -227,10 +434,22 @@ if ($missingHashItems.Count -gt 0) {
             $stillMissing += $batch.Count
         }
 
-        $batchProgress = [math]::Min(100, [math]::Round(($i + $batchSize) / $missingHashItems.Count * 100))
+        $batchesSinceCheckpoint++
+        if ($batchesSinceCheckpoint -ge 5) {
+            Save-CheckpointBatch $recoveredBuffer $checkpointResults
+            $recoveredBuffer.Clear()
+            $batchesSinceCheckpoint = 0
+        }
+
+        $batchProgress = [math]::Min(100, [math]::Round(($i + $batchSize) / $pass2Items.Count * 100))
         Write-Progress -Activity "Retrieving missing hashes" `
             -Status "Recovered: $recovered | Still missing: $stillMissing" `
             -PercentComplete $batchProgress -Id 2
+    }
+
+    if ($recoveredBuffer.Count -gt 0) {
+        Save-CheckpointBatch $recoveredBuffer $checkpointResults
+        $recoveredBuffer.Clear()
     }
 
     Write-Progress -Activity "Retrieving missing hashes" -Completed -Id 2
@@ -239,10 +458,14 @@ if ($missingHashItems.Count -gt 0) {
 
 # --- Export to CSV ---
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
 $csvPath = Join-Path $scriptDir "OneDrive_Hashes_$timestamp.csv"
 
 $global:Results | Sort-Object FullPath | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+# --- Clean up checkpoint (scan completed successfully) ---
+Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+Remove-Item $checkpointResults -ErrorAction SilentlyContinue
+Remove-Item $checkpointMissing -ErrorAction SilentlyContinue
 
 # --- Final summary ---
 $totalElapsed = $scanStart.Elapsed.ToString("hh\:mm\:ss")
@@ -252,9 +475,10 @@ Write-Host "  Folders scanned:     $foldersScanned" -ForegroundColor White
 Write-Host "  Total items seen:    $totalItemsSeen" -ForegroundColor White
 Write-Host "  Files with hash:     $($global:Results.Count)" -ForegroundColor White
 if ($missingHashItems.Count -gt 0) {
-    Write-Host "  Hashes recovered:    $recovered (from $($missingHashItems.Count) missing)" -ForegroundColor White
+    Write-Host "  Hashes recovered:    $($recovered + $alreadyRecovered) (from $($missingHashItems.Count) missing)" -ForegroundColor White
 }
 Write-Host "  Results saved to:    $csvPath" -ForegroundColor Cyan
+Write-Host "  Checkpoint cleared." -ForegroundColor Gray
 
 if ($GroupDuplicates) {
     $duplicateGroups = $global:Results |

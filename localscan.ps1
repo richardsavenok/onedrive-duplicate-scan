@@ -1,6 +1,7 @@
 # ================================================
 # Local Drive Duplicate Scanner
 # Hashes files on disk and identifies duplicates
+# Supports checkpoint/resume for interrupted scans
 # ================================================
 
 #Requires -Version 5.1
@@ -23,11 +24,101 @@ if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
 }
 
 $Path = (Resolve-Path -LiteralPath $Path).Path
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
 
-Write-Host "Starting local scan of: $Path" -ForegroundColor Green
+$checkpointMeta = Join-Path $scriptDir "localscan_checkpoint.json"
+$checkpointData = Join-Path $scriptDir "localscan_checkpoint.csv"
+
+# --- Helper: append rows to checkpoint CSV ---
+function Save-CheckpointBatch {
+    param(
+        [System.Collections.Generic.List[PSCustomObject]]$Items,
+        [string]$FilePath
+    )
+    if ($Items.Count -eq 0) { return }
+    if (-not (Test-Path $FilePath)) {
+        $Items | Export-Csv -Path $FilePath -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        $Items | ConvertTo-Csv -NoTypeInformation | Select-Object -Skip 1 | Add-Content -Path $FilePath -Encoding UTF8
+    }
+}
+
+# --- Check for existing checkpoint ---
+$hashCache = @{}
+$resuming = $false
+
+if (Test-Path $checkpointMeta) {
+    $meta = Get-Content $checkpointMeta -Raw | ConvertFrom-Json
+
+    Write-Host "`nFound an existing scan checkpoint:" -ForegroundColor Yellow
+    Write-Host "  Scan path:    $($meta.Path)" -ForegroundColor White
+    Write-Host "  Algorithm:    $($meta.Algorithm)" -ForegroundColor White
+    Write-Host "  Started at:   $($meta.StartedAt)" -ForegroundColor White
+
+    $cachedCount = 0
+    if (Test-Path $checkpointData) {
+        $cachedRows = Import-Csv $checkpointData
+        $cachedCount = @($cachedRows).Count
+    }
+    Write-Host "  Files cached: $cachedCount" -ForegroundColor White
+
+    $choice = Read-Host "`nContinue from checkpoint? (Y = continue, N = start fresh)"
+
+    if ($choice -match '^[Yy]') {
+        if ($meta.Path -ne $Path) {
+            Write-Host "  Scan path differs from checkpoint ('$($meta.Path)' vs '$Path'). Starting fresh." -ForegroundColor Red
+            Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+            Remove-Item $checkpointData -ErrorAction SilentlyContinue
+        }
+        elseif ($meta.Algorithm -ne $Algorithm) {
+            Write-Host "  Algorithm differs from checkpoint ('$($meta.Algorithm)' vs '$Algorithm'). Starting fresh." -ForegroundColor Red
+            Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+            Remove-Item $checkpointData -ErrorAction SilentlyContinue
+        }
+        elseif ($cachedCount -gt 0) {
+            $resuming = $true
+            foreach ($row in $cachedRows) {
+                if ($row.FileHash -and $row.FileHash -ne 'ERROR' -and $row.FileHash -ne '') {
+                    $hashCache[$row.FullPath] = @{
+                        Hash           = $row.FileHash
+                        SizeBytes      = [long]$row.SizeBytes
+                        LastWriteTicks = [long]$row.LastWriteTicks
+                    }
+                }
+            }
+            Write-Host "  Loaded $($hashCache.Count) cached hashes. Resuming scan..." -ForegroundColor Green
+        }
+        else {
+            Write-Host "  Checkpoint has no cached data. Starting fresh." -ForegroundColor Yellow
+            Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+            Remove-Item $checkpointData -ErrorAction SilentlyContinue
+        }
+    }
+    else {
+        Write-Host "Starting fresh scan." -ForegroundColor Cyan
+        Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+        Remove-Item $checkpointData -ErrorAction SilentlyContinue
+    }
+}
+
+# --- Write checkpoint metadata ---
+if (-not $resuming) {
+    @{
+        Path      = $Path
+        Algorithm = $Algorithm
+        Exclude   = @($Exclude)
+        StartedAt = (Get-Date -Format "o")
+    } | ConvertTo-Json -Depth 3 | Set-Content $checkpointMeta -Encoding UTF8
+}
+
+Write-Host "`nStarting local scan of: $Path" -ForegroundColor Green
 Write-Host "  Hash algorithm: $Algorithm" -ForegroundColor Gray
 if ($Exclude) {
     Write-Host "  Excluding: $($Exclude -join ', ')" -ForegroundColor Gray
+}
+if ($resuming) {
+    Write-Host "  Resuming with $($hashCache.Count) cached hashes" -ForegroundColor Gray
 }
 
 $scanStart = [System.Diagnostics.Stopwatch]::StartNew()
@@ -54,6 +145,8 @@ Write-Host "  Found $fileCount files in $([math]::Round($sw.Elapsed.TotalSeconds
 
 if ($fileCount -eq 0) {
     Write-Host "No files to scan." -ForegroundColor Yellow
+    Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+    Remove-Item $checkpointData -ErrorAction SilentlyContinue
     exit 0
 }
 
@@ -71,8 +164,12 @@ Write-Host "  $uniqueBySize files have unique sizes (skipping hash)" -Foreground
 Write-Host "  $hashCandidateCount files share a size and will be hashed" -ForegroundColor Gray
 
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+$checkpointBuffer = [System.Collections.Generic.List[PSCustomObject]]::new()
 $errors = 0
 $hashed = 0
+$cacheHits = 0
+$checkpointInterval = 500
+$pendingSinceLastSave = 0
 
 foreach ($file in ($sizeGroups | Where-Object { $_.Count -eq 1 } | ForEach-Object { $_.Group[0] })) {
     $null = $results.Add([PSCustomObject]@{
@@ -90,46 +187,81 @@ foreach ($group in $toHash) {
         $hashed++
         if ($hashed % 100 -eq 0 -or $hashed -eq $hashCandidateCount) {
             $elapsed = $scanStart.Elapsed.ToString("hh\:mm\:ss")
+            $cacheLabel = if ($cacheHits -gt 0) { " | Cache hits: $cacheHits" } else { "" }
             Write-Progress -Activity "Hashing files [$elapsed elapsed]" `
-                -Status "$hashed / $hashCandidateCount" `
+                -Status "$hashed / $hashCandidateCount$cacheLabel" `
                 -PercentComplete ([math]::Min(100, [math]::Round($hashed / $hashCandidateCount * 100))) `
                 -Id 1
         }
 
-        try {
-            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm $Algorithm -ErrorAction Stop).Hash
-            $null = $results.Add([PSCustomObject]@{
-                FullPath     = $file.FullName
-                FileName     = $file.Name
-                FileHash     = $hash
-                SizeBytes    = $file.Length
-                LastModified = $file.LastWriteTime
-                Created      = $file.CreationTime
-            })
+        $hash = $null
+        $fromCache = $false
+
+        $cached = $hashCache[$file.FullName]
+        if ($cached -and $cached.SizeBytes -eq $file.Length -and $cached.LastWriteTicks -eq $file.LastWriteTime.Ticks) {
+            $hash = $cached.Hash
+            $cacheHits++
+            $fromCache = $true
         }
-        catch {
-            $errors++
-            $null = $results.Add([PSCustomObject]@{
-                FullPath     = $file.FullName
-                FileName     = $file.Name
-                FileHash     = "ERROR"
-                SizeBytes    = $file.Length
-                LastModified = $file.LastWriteTime
-                Created      = $file.CreationTime
+
+        if (-not $fromCache) {
+            try {
+                $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm $Algorithm -ErrorAction Stop).Hash
+            }
+            catch {
+                $hash = "ERROR"
+                $errors++
+            }
+        }
+
+        $null = $results.Add([PSCustomObject]@{
+            FullPath     = $file.FullName
+            FileName     = $file.Name
+            FileHash     = $hash
+            SizeBytes    = $file.Length
+            LastModified = $file.LastWriteTime
+            Created      = $file.CreationTime
+        })
+
+        if (-not $fromCache) {
+            $null = $checkpointBuffer.Add([PSCustomObject]@{
+                FullPath       = $file.FullName
+                FileName       = $file.Name
+                FileHash       = $hash
+                SizeBytes      = $file.Length
+                LastModified   = $file.LastWriteTime
+                Created        = $file.CreationTime
+                LastWriteTicks = $file.LastWriteTime.Ticks
             })
+            $pendingSinceLastSave++
+
+            if ($pendingSinceLastSave -ge $checkpointInterval) {
+                Save-CheckpointBatch $checkpointBuffer $checkpointData
+                $checkpointBuffer.Clear()
+                $pendingSinceLastSave = 0
+            }
         }
     }
 }
 
+if ($checkpointBuffer.Count -gt 0) {
+    Save-CheckpointBatch $checkpointBuffer $checkpointData
+    $checkpointBuffer.Clear()
+}
+
 Write-Progress -Activity "Hashing files" -Completed -Id 1
-Write-Host "  Hashed $hashed files in $([math]::Round($sw.Elapsed.TotalSeconds, 1))s ($errors errors)" -ForegroundColor Gray
+$cacheMsg = if ($cacheHits -gt 0) { ", $cacheHits from cache" } else { "" }
+Write-Host "  Hashed $hashed files in $([math]::Round($sw.Elapsed.TotalSeconds, 1))s ($errors errors$cacheMsg)" -ForegroundColor Gray
 
 # --- Export to CSV ---
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
 $csvPath = Join-Path $scriptDir "Local_Hashes_$timestamp.csv"
 
 $results | Sort-Object FullPath | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+# --- Clean up checkpoint (scan completed successfully) ---
+Remove-Item $checkpointMeta -ErrorAction SilentlyContinue
+Remove-Item $checkpointData -ErrorAction SilentlyContinue
 
 # --- Final summary ---
 $totalElapsed = $scanStart.Elapsed.ToString("hh\:mm\:ss")
@@ -137,11 +269,15 @@ Write-Host "`n=== Scan Complete ===" -ForegroundColor Green
 Write-Host "  Total time:          $totalElapsed" -ForegroundColor White
 Write-Host "  Total files:         $fileCount" -ForegroundColor White
 Write-Host "  Files hashed:        $hashed" -ForegroundColor White
+if ($cacheHits -gt 0) {
+    Write-Host "  Cache hits:          $cacheHits" -ForegroundColor White
+}
 Write-Host "  Skipped (unique size): $uniqueBySize" -ForegroundColor White
 if ($errors -gt 0) {
     Write-Host "  Errors:              $errors" -ForegroundColor Red
 }
 Write-Host "  Results saved to:    $csvPath" -ForegroundColor Cyan
+Write-Host "  Checkpoint cleared." -ForegroundColor Gray
 
 if ($GroupDuplicates) {
     $hashableResults = $results | Where-Object { $_.FileHash -and $_.FileHash -ne "ERROR" }

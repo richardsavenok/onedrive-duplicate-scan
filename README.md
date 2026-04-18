@@ -8,21 +8,24 @@ PowerShell scripts for finding duplicate files -- in OneDrive cloud storage or o
 
 Scans your entire OneDrive via the Microsoft Graph API using QuickXorHash fingerprints. No files are downloaded.
 
-1. **Authenticates** with Microsoft Graph using interactive browser login.
-2. **Scans** every folder using breadth-first traversal, collecting file metadata and QuickXorHash values.
-3. **Recovers missing hashes** via batch API requests for files that didn't return a hash on the first pass.
-4. **Exports** all file records to a timestamped CSV in the script directory.
-5. **Optionally groups duplicates** with `-GroupDuplicates`.
+1. **Checks for a checkpoint** -- if a previous scan was interrupted, prompts to resume or start fresh.
+2. **Authenticates** with Microsoft Graph using interactive browser login.
+3. **Scans** every folder using breadth-first traversal, collecting file metadata and QuickXorHash values. **Saves progress** every 50 folders.
+4. **Recovers missing hashes** via batch API requests for files that didn't return a hash on the first pass. Skips items already recovered in a previous partial run.
+5. **Exports** all file records to a timestamped CSV in the script directory and clears the checkpoint.
+6. **Optionally groups duplicates** with `-GroupDuplicates`.
 
 ### `localscan.ps1` -- Local Drive Scanner
 
 Scans a local directory tree, hashing files to find duplicates. Uses a size pre-filter to skip hashing files with unique sizes, dramatically speeding up large scans.
 
-1. **Enumerates** all files recursively in the target directory.
-2. **Groups by file size** -- files with a unique size can't be duplicates, so they're skipped.
-3. **Hashes** only files that share a size with at least one other file.
-4. **Exports** all file records to a timestamped CSV in the script directory.
-5. **Optionally groups duplicates** with `-GroupDuplicates`.
+1. **Checks for a checkpoint** -- if a previous scan was interrupted, prompts to resume or start fresh.
+2. **Enumerates** all files recursively in the target directory.
+3. **Groups by file size** -- files with a unique size can't be duplicates, so they're skipped.
+4. **Hashes** only files that share a size with at least one other file, using cached hashes from the checkpoint where available.
+5. **Saves progress** periodically so interrupted scans can be resumed without starting over.
+6. **Exports** all file records to a timestamped CSV in the script directory and clears the checkpoint.
+7. **Optionally groups duplicates** with `-GroupDuplicates`.
 
 ## Prerequisites
 
@@ -112,6 +115,52 @@ Both scripts produce CSVs in the script directory. With `-GroupDuplicates`, a se
 | SizeBytes | File size in bytes |
 | LastModified | Last modified timestamp |
 | Created | Creation timestamp |
+
+## Checkpoint / Resume
+
+Both scripts automatically save progress to checkpoint files in the script directory. If a scan is interrupted (Ctrl+C, crash, system restart), the next run detects the checkpoint and prompts to continue or start fresh.
+
+### `localscan.ps1`
+
+Checkpoint files: `localscan_checkpoint.json`, `localscan_checkpoint.csv`
+
+```
+Found an existing scan checkpoint:
+  Scan path:    D:\Photos
+  Algorithm:    SHA256
+  Started at:   2026-04-17T10:30:00
+  Files cached: 12345
+
+Continue from checkpoint? (Y = continue, N = start fresh)
+```
+
+- **Y** -- Loads cached hashes and skips re-hashing files that haven't changed (validated by path, size, and last modified timestamp).
+- **N** -- Deletes the checkpoint and starts a fresh scan.
+
+If the scan path or algorithm differs from the checkpoint, the script automatically starts fresh.
+
+### `dupescan.ps1`
+
+Checkpoint files: `dupescan_checkpoint.json`, `dupescan_checkpoint_results.csv`, `dupescan_checkpoint_missing.csv`
+
+```
+Found an existing scan checkpoint:
+  Drive ID:         b!abc123...
+  Started at:       2026-04-17T10:30:00
+  Folders scanned:  250
+  Files found:      8400
+  Queue remaining:  73
+  Pass 1 complete:  False
+
+Continue from checkpoint? (Y = continue, N = start fresh)
+```
+
+- **Y** -- Restores the BFS queue, collected results, and missing-hash items. Resumes the folder traversal from where it stopped. If pass 1 (BFS) was already complete, skips straight to pass 2 (batch hash recovery), filtering out items already recovered.
+- **N** -- Deletes the checkpoint and starts a fresh scan.
+
+If the drive ID differs from the checkpoint, the script automatically starts fresh.
+
+Both scripts delete their checkpoint files on successful completion.
 
 ## Duplicate report
 
